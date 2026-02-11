@@ -9,3 +9,6 @@ scikit-learn
 python-docx
 openpyxl
 supabase
+fpdf                # for professional PDF reports
+markdown            # for rich text rendering
+st-pages            # optional, for multi‑page; not required
