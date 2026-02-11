@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
-# -------------------- ADVANCED DEPENDENCIES (graceful fallbacks) --------------------
+# -------------------- ADVANCED DEPENDENCIES --------------------
 try:
     import pdfplumber
     PDF_SUPPORT = True
@@ -29,8 +29,6 @@ try:
 except ImportError:
     SUPABASE_AVAILABLE = False
 
-# Semantic similarity
-SEMANTIC_AVAILABLE = False
 try:
     from sentence_transformers import SentenceTransformer, util
     SEMANTIC_AVAILABLE = True
@@ -58,9 +56,7 @@ class ComplianceConfig:
 # -------------------- SUPABASE CLIENT --------------------
 @st.cache_resource
 def init_supabase() -> Optional[Client]:
-    """Initialize Supabase client using secrets."""
     if not SUPABASE_AVAILABLE:
-        st.warning("Supabase package not installed. Run: pip install supabase")
         return None
     try:
         url = st.secrets["SUPABASE_URL"]
@@ -72,15 +68,12 @@ def init_supabase() -> Optional[Client]:
 
 # -------------------- HANDBOOK PERSISTENCE --------------------
 def save_handbook(content: str):
-    """Store or update the handbook in Supabase."""
     supabase = init_supabase()
     if not supabase:
         return False
     try:
-        # Check if handbook already exists
         result = supabase.table("handbooks").select("*").execute()
         if result.data:
-            # Update the first row (we only store one handbook)
             supabase.table("handbooks").update({
                 "content": content,
                 "updated_at": "now()"
@@ -93,7 +86,6 @@ def save_handbook(content: str):
         return False
 
 def load_handbook() -> str:
-    """Retrieve the saved handbook from Supabase."""
     supabase = init_supabase()
     if not supabase:
         return ""
@@ -107,15 +99,12 @@ def load_handbook() -> str:
 
 # -------------------- BILL MONITORING --------------------
 def add_monitored_bill(bill_id: str, bill_title: str, text_hash: str):
-    """Start monitoring a bill for changes."""
     supabase = init_supabase()
     if not supabase:
         return False
     try:
-        # Check if already monitored
         existing = supabase.table("monitored_bills").select("*").eq("bill_id", bill_id).execute()
         if existing.data:
-            # Update hash and timestamp
             supabase.table("monitored_bills").update({
                 "last_text_hash": text_hash,
                 "last_checked": "now()",
@@ -134,7 +123,6 @@ def add_monitored_bill(bill_id: str, bill_title: str, text_hash: str):
         return False
 
 def get_monitored_bills() -> List[Dict]:
-    """Retrieve all monitored bills."""
     supabase = init_supabase()
     if not supabase:
         return []
@@ -146,20 +134,14 @@ def get_monitored_bills() -> List[Dict]:
         return []
 
 def check_bill_updates(api_key: str) -> List[Dict]:
-    """
-    Check all monitored bills for changes.
-    Returns list of bills that have changed.
-    """
     monitored = get_monitored_bills()
     changed = []
     for bill in monitored:
-        # Fetch latest metadata
         bill_data = fetch_bill_metadata(bill["bill_id"], api_key)
         if "error" in bill_data:
             continue
         if not bill_data.get("text_url"):
             continue
-        # Extract current text
         current_text = extract_bill_text(bill_data["text_url"])
         current_hash = hashlib.md5(current_text.encode()).hexdigest()
         if current_hash != bill.get("last_text_hash"):
@@ -170,7 +152,6 @@ def check_bill_updates(api_key: str) -> List[Dict]:
                 "new_hash": current_hash,
                 "last_checked": bill.get("last_checked")
             })
-            # Update the record with new hash
             supabase = init_supabase()
             if supabase:
                 supabase.table("monitored_bills").update({
@@ -179,7 +160,7 @@ def check_bill_updates(api_key: str) -> List[Dict]:
                 }).eq("bill_id", bill["bill_id"]).execute()
     return changed
 
-# -------------------- CORE HELPER FUNCTIONS --------------------
+# -------------------- CORE HELPER FUNCTIONS (YOUR ORIGINAL) --------------------
 def validate_schema(df: pd.DataFrame, required_columns: dict) -> list:
     errors = []
     missing_cols = [col for col in required_columns.keys() if col not in df.columns]
@@ -202,10 +183,10 @@ def tokenize_sentences(text: str) -> list:
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
     return [s.strip() for s in sentences if s.strip()]
 
-# -------------------- OPEN STATES API --------------------
+# -------------------- OPEN STATES API (IMPROVED SEARCH) --------------------
 @st.cache_data(ttl=300)
 def search_bills(keyword: str, api_key: str) -> List[Dict]:
-    """Return up to 10 bills matching keyword."""
+    """Return up to 10 bills matching keyword, excluding resolutions/commemoratives."""
     if not api_key:
         return []
     headers = {"X-API-KEY": api_key}
@@ -221,19 +202,26 @@ def search_bills(keyword: str, api_key: str) -> List[Dict]:
         if resp.status_code != 200:
             return []
         data = resp.json()
-        return data.get("results", [])
+        results = data.get("results", [])
+        # Filter out resolutions and commemorative bills
+        filtered = []
+        for bill in results:
+            classifications = bill.get("classification", [])
+            if not any(c in ["resolution", "commemorative", "memorial"] for c in classifications):
+                filtered.append(bill)
+        return filtered[:10]
     except:
         return []
 
 @st.cache_data(ttl=3600)
-def fetch_bill_metadata(bill_id: str, api_key: str) -> Dict:
+def get_bill_by_number(bill_number: str, api_key: str) -> Dict:
     """Fetch a specific bill by its identifier (e.g., 'HB33')."""
     if not api_key:
         return {"error": "API key missing."}
     headers = {"X-API-KEY": api_key}
     params = {
         "jurisdiction": ComplianceConfig.OPENSTATES_JURISDICTION,
-        "bill_id": bill_id,
+        "bill_id": bill_number.upper(),
         "page": 1,
         "per_page": 1
     }
@@ -243,7 +231,7 @@ def fetch_bill_metadata(bill_id: str, api_key: str) -> Dict:
             return {"error": f"API error {resp.status_code}"}
         data = resp.json()
         if not data.get("results"):
-            return {"error": f"Bill '{bill_id}' not found."}
+            return {"error": f"Bill '{bill_number}' not found."}
         bill = data["results"][0]
         text_url = None
         versions = bill.get("versions", [])
@@ -335,7 +323,6 @@ def compute_semantic_differences(policy_text: str, bill_text: str) -> Dict:
         except:
             pass
     
-    # TF-IDF fallback
     try:
         all_sentences = policy_sentences + bill_sentences
         vectorizer = TfidfVectorizer().fit_transform(all_sentences)
@@ -393,25 +380,24 @@ def render_side_by_side_diff(policy_sentences, bill_sentences):
             for sent in bill_sentences[j1:j2]:
                 st.success(sent)
 
-# -------------------- LEGISLATIVE INTELLIGENCE MODULE --------------------
+# -------------------- 🏥 LEGISLATIVE INTELLIGENCE MODULE --------------------
 def render_legislative_redliner():
     st.header("⚖️ Legislative Intelligence Engine")
     st.markdown("##### Persistent Handbook + Bill Monitoring")
     st.markdown("---")
     
-    # ---------- API Key Check ----------
     api_key = st.secrets.get("OPENSTATES_API_KEY") if hasattr(st, 'secrets') else None
     if not api_key:
         st.error("🚨 Open States API key missing. Add to Streamlit Secrets.")
         st.stop()
     
-    # ---------- Load saved handbook ----------
+    # Load saved handbook
     if "handbook_loaded" not in st.session_state:
         saved = load_handbook()
         st.session_state.handbook_content = saved
         st.session_state.handbook_loaded = True
     
-    # ---------- Check monitored bills for updates ----------
+    # Sidebar: Monitored Bills
     with st.sidebar.expander("🔔 Monitored Bills", expanded=True):
         if st.button("🔄 Check for Updates"):
             with st.spinner("Checking monitored bills..."):
@@ -421,7 +407,6 @@ def render_legislative_redliner():
                         st.error(f"🚨 **{b['bill_id']}** – {b['bill_title'][:80]}...\n\n*Changed since {b['last_checked']}*")
                 else:
                     st.success("All monitored bills are up to date.")
-        
         monitored = get_monitored_bills()
         if monitored:
             for m in monitored:
@@ -429,26 +414,40 @@ def render_legislative_redliner():
         else:
             st.info("No bills being monitored.")
     
-    # ---------- Bill Search ----------
+    # ---------- Two Ways to Find a Bill ----------
     st.subheader("🔎 Find Relevant Legislation")
-    keyword = st.text_input("Search Ohio bills by keyword (e.g., 'minimum wage', 'healthcare')")
     
-    if keyword:
-        results = search_bills(keyword, api_key)
-        if results:
-            bill_titles = [f"{r['identifier']}: {r['title'][:80]}..." for r in results]
-            selected_idx = st.selectbox("Select a bill to analyze", range(len(bill_titles)), format_func=lambda i: bill_titles[i])
-            selected_bill = results[selected_idx]
-            bill_id = selected_bill["identifier"]
-            
-            # Fetch full metadata
-            with st.spinner("Fetching bill details..."):
-                bill_data = fetch_bill_metadata(bill_id, api_key)
-                if "error" not in bill_data:
+    method = st.radio("Search method:", ["By Bill Number (e.g., HB33)", "By Keyword"], horizontal=True)
+    
+    if method == "By Bill Number (e.g., HB33)":
+        bill_number = st.text_input("Enter bill number", value="HB33").strip()
+        if st.button("Fetch Bill", type="primary"):
+            with st.spinner("Fetching bill..."):
+                bill_data = get_bill_by_number(bill_number, api_key)
+                if "error" in bill_data:
+                    st.error(bill_data["error"])
+                    st.session_state.current_bill = None
+                else:
                     st.session_state.current_bill = bill_data
                     st.session_state.bill_text = None
+    else:
+        keyword = st.text_input("Search by keyword (e.g., 'minimum wage', 'healthcare')")
+        if keyword:
+            with st.spinner("Searching..."):
+                results = search_bills(keyword, api_key)
+                if results:
+                    bill_titles = [f"{r['identifier']}: {r['title'][:80]}..." for r in results]
+                    selected_idx = st.selectbox("Select a bill to analyze", range(len(bill_titles)), format_func=lambda i: bill_titles[i])
+                    selected_bill = results[selected_idx]
+                    with st.spinner("Fetching details..."):
+                        bill_data = get_bill_by_number(selected_bill["identifier"], api_key)
+                        if "error" not in bill_data:
+                            st.session_state.current_bill = bill_data
+                            st.session_state.bill_text = None
+                        else:
+                            st.error(bill_data["error"])
                 else:
-                    st.error(bill_data["error"])
+                    st.warning("No matching bills found. Try different keywords.")
     
     # ---------- Display Current Bill ----------
     if st.session_state.get("current_bill"):
@@ -465,7 +464,6 @@ def render_legislative_redliner():
                 st.markdown(f"**Full text:** [{bill['text_url']}]({bill['text_url']})")
             st.markdown(f"**Abstract:** {bill.get('abstract', 'No abstract.')}")
         
-        # ---------- Extract Full Text ----------
         if bill.get('text_url'):
             col1, col2 = st.columns([1,1])
             with col1:
@@ -473,9 +471,8 @@ def render_legislative_redliner():
                     with st.spinner("Downloading..."):
                         st.session_state.bill_text = extract_bill_text(bill['text_url'])
             with col2:
-                # Monitor button
                 if st.button("🔔 Monitor This Bill", use_container_width=True):
-                    if st.session_state.bill_text:
+                    if st.session_state.get("bill_text"):
                         text_hash = hashlib.md5(st.session_state.bill_text.encode()).hexdigest()
                         if add_monitored_bill(bill['identifier'], bill['title'], text_hash):
                             st.success("Now monitoring this bill for changes.")
@@ -497,28 +494,21 @@ def render_legislative_redliner():
         key="handbook_editor"
     )
     
-    col_save, _ = st.columns([1,3])
-    with col_save:
-        if st.button("💾 Save Handbook to Cloud", use_container_width=True):
-            if handbook.strip():
-                if save_handbook(handbook):
-                    st.success("Handbook saved permanently.")
-                    st.session_state.handbook_content = handbook
-                else:
-                    st.error("Failed to save handbook.")
+    if st.button("💾 Save Handbook to Cloud", use_container_width=True):
+        if handbook.strip():
+            if save_handbook(handbook):
+                st.success("Handbook saved permanently.")
+                st.session_state.handbook_content = handbook
+            else:
+                st.error("Failed to save handbook.")
     
     # ---------- Compliance Gap Analysis ----------
     if st.session_state.get("bill_text") and st.session_state.get("handbook_content"):
         st.markdown("---")
         st.subheader("🔬 Compliance Gap Analysis")
-        
         if st.button("Run Full Analysis", type="primary", use_container_width=True):
             with st.spinner("Analyzing..."):
-                policy_sentences = tokenize_sentences(st.session_state.handbook_content)
-                bill_sentences = tokenize_sentences(st.session_state.bill_text)
                 semantic = compute_semantic_differences(st.session_state.handbook_content, st.session_state.bill_text)
-                
-                # Display risk score
                 if "overall_similarity" in semantic:
                     sim = semantic["overall_similarity"]
                     risk = semantic.get("compliance_risk", "UNKNOWN")
@@ -529,12 +519,11 @@ def render_legislative_redliner():
                     with cols[2]:
                         st.info(f"**Method:** {semantic.get('method', 'N/A')}")
                 
-                # Sentence-level risks
                 if semantic.get("sentence_analysis"):
                     with st.expander("⚠️ High‑Risk Policy Sentences", expanded=True):
                         risky = [s for s in semantic["sentence_analysis"] if s.get("risk") == "HIGH"][:5]
                         if risky:
-                            for r in risky:
+                            for r in risky[:5]:
                                 st.markdown(f"- **Policy:** {r['policy_sentence']}")
                                 st.markdown(f"  → **Bill:** {r['bill_sentence'][:150]}...")
                                 st.markdown(f"  *Similarity: {r['similarity']:.1%}*")
@@ -542,11 +531,12 @@ def render_legislative_redliner():
                         else:
                             st.success("No high‑risk sentences detected.")
                 
-                # Traditional diff
                 with st.expander("📝 Character‑level Difference"):
-                    render_side_by_side_diff(policy_sentences, bill_sentences)
+                    render_side_by_side_diff(
+                        tokenize_sentences(st.session_state.handbook_content),
+                        tokenize_sentences(st.session_state.bill_text)
+                    )
                 
-                # Export
                 export_data = {
                     "bill": st.session_state.current_bill,
                     "handbook": st.session_state.handbook_content,
@@ -560,22 +550,173 @@ def render_legislative_redliner():
                     mime="application/json"
                 )
 
-# -------------------- EXISTING MODULES (unchanged, but keep them) --------------------
+# -------------------- 💰 TUITION REIMBURSEMENT MODULE (YOUR ORIGINAL, RESTORED) --------------------
 def render_tuition_module():
-    st.header("💰 Tuition Reimbursement Auditor")
-    # ... (your existing code – keep as is)
-    # I'll include a minimal version here; replace with your full original.
-    st.info("Tuition module is active. [Your existing code runs here]")
+    st.header("💰 Tuition Reimbursement Audit")
+    st.markdown("### IRS Section 127 & Tenure Eligibility Engine")
+    st.markdown(
+        """
+        **Purpose:** Batch process scholarship requests to determine eligibility and tax liability.
+        **Statutory Reference:** 26 U.S. Code § 127 - Educational assistance programs.
+        """
+    )
 
+    with st.expander("📥 Download Batch Template", expanded=False):
+        st.caption("Use this schema for upload. Do not include sensitive PII in non-secure environments.")
+        template_df = pd.DataFrame(columns=['EmployeeID', 'TenureYears', 'RequestAmount', 'DegreeProgram'])
+        st.download_button(
+            label="Download Empty CSV Schema",
+            data=template_df.to_csv(index=False),
+            file_name="tuition_audit_template.csv",
+            mime="text/csv"
+        )
+
+    uploaded_file = st.file_uploader("Upload Request CSV", type=['csv'])
+
+    if uploaded_file:
+        try:
+            df = pd.read_csv(uploaded_file)
+        except Exception as e:
+            st.error(f"Failed to parse CSV: {e}")
+            return
+
+        required_schema = {
+            'EmployeeID': 'str',
+            'TenureYears': 'float',
+            'RequestAmount': 'float'
+        }
+        
+        validation_errors = validate_schema(df, required_schema)
+        if validation_errors:
+            for err in validation_errors:
+                st.error(f"Schema Validation Error: {err}")
+            st.stop()
+
+        df['TenureYears'] = pd.to_numeric(df['TenureYears'], errors='coerce')
+        df['RequestAmount'] = pd.to_numeric(df['RequestAmount'], errors='coerce')
+        
+        if df.isna().any().any():
+            st.warning("Rows with invalid numeric data were excluded from analysis.")
+            df.dropna(subset=['TenureYears', 'RequestAmount'], inplace=True)
+
+        conditions = [
+            (df['TenureYears'] < ComplianceConfig.MIN_TENURE_YEARS),
+            (df['RequestAmount'] > ComplianceConfig.IRS_SEC_127_LIMIT)
+        ]
+        
+        choices_status = ['Ineligible', 'Eligible (Taxable)']
+        choices_basis = [
+            f"Tenure below minimum ({ComplianceConfig.MIN_TENURE_YEARS} year)",
+            f"Exceeds IRS Sec. 127 Limit (${ComplianceConfig.IRS_SEC_127_LIMIT:,.2f})"
+        ]
+        
+        df['Decision_Status'] = np.select(conditions, choices_status, default='Eligible (Tax-Free)')
+        df['Decision_Basis'] = np.select(conditions, choices_basis, default='Meets Tenure & IRS Criteria')
+        
+        df['Taxable_Amount'] = np.where(
+            df['Decision_Status'] == 'Eligible (Taxable)',
+            df['RequestAmount'] - ComplianceConfig.IRS_SEC_127_LIMIT,
+            0.0
+        )
+
+        st.divider()
+        st.subheader("Audit Results")
+        
+        total_exposure = df['Taxable_Amount'].sum()
+        ineligible_count = len(df[df['Decision_Status'] == 'Ineligible'])
+        
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Records Processed", len(df))
+        m2.metric("Total Taxable Exposure", f"${total_exposure:,.2f}")
+        m3.metric("Ineligible Requests", ineligible_count)
+
+        st.dataframe(
+            df[['EmployeeID', 'RequestAmount', 'Decision_Status', 'Taxable_Amount', 'Decision_Basis']],
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        output_csv = df.to_csv(index=False)
+        st.download_button(
+            "📄 Download Audit Report",
+            data=output_csv,
+            file_name=f"tuition_audit_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+
+# -------------------- 📝 POLICY REDLINER MODULE (YOUR ORIGINAL, RESTORED) --------------------
 def render_redliner_module():
-    st.header("📝 Policy Redliner (Classic)")
-    # ... (your existing code)
-    st.info("Classic redliner module.")
+    st.header("📝 Policy Gap Analysis")
+    st.markdown("### Statutory vs. Internal Policy Comparator")
+    st.markdown(
+        """
+        **Purpose:** Compare internal policy text against statutory text at the sentence level to identify compliance gaps.
+        **Method:** Tokenizes text into sentences and performs a sequence match diff.
+        """
+    )
 
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### Internal Policy Text")
+        policy_text = st.text_area("Paste current handbook text here:", height=300, key="redliner_policy")
+    with col2:
+        st.markdown("#### New Statutory Text")
+        statute_text = st.text_area("Paste new legislative text here:", height=300, key="redliner_statute")
+
+    if st.button("Run Gap Analysis"):
+        if not policy_text or not statute_text:
+            st.warning("Both text fields are required for analysis.")
+            return
+
+        st.divider()
+        st.subheader("Analysis Output")
+
+        policy_sentences = tokenize_sentences(policy_text)
+        statute_sentences = tokenize_sentences(statute_text)
+
+        render_side_by_side_diff(policy_sentences, statute_sentences)
+
+# -------------------- 📅 TIMELINE PROJECTOR MODULE (YOUR ORIGINAL, RESTORED) --------------------
 def render_projector_module():
-    st.header("📅 Compliance Work‑Back Schedule")
-    # ... (your existing code)
-    st.info("Timeline projector module.")
+    st.header("📅 Compliance Work-Back Schedule")
+    st.markdown("### Implementation Timeline Generator")
+    st.markdown("**Purpose:** Generate operational milestones backwards from a statutory effective date.")
+
+    effective_date = st.date_input("Statutory Effective Date")
+    
+    if st.button("Generate Timeline"):
+        milestones = [
+            ("Audit of Current Policies", 90),
+            ("Drafting of Policy Updates", 60),
+            ("Legal Counsel Review", 45),
+            ("Executive Sign-off", 30),
+            ("Manager Training", 15),
+            ("Employee Notification", 7),
+            ("Go-Live / Effective Date", 0)
+        ]
+
+        st.subheader("Operational Milestones")
+        
+        timeline_data = []
+        for task, days in milestones:
+            due_date = effective_date - timedelta(days=days)
+            timeline_data.append({
+                "Milestone": task,
+                "Due Date": due_date.strftime('%Y-%m-%d'),
+                "Days Until Effective": days,
+                "Phase": "Preparation" if days > 0 else "Execution"
+            })
+        
+        timeline_df = pd.DataFrame(timeline_data)
+        st.table(timeline_df)
+        
+        csv = timeline_df.to_csv(index=False)
+        st.download_button(
+            "📥 Export Timeline (CSV)",
+            data=csv,
+            file_name=f"compliance_timeline_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
 
 # -------------------- MAIN APP SHELL --------------------
 def main():
