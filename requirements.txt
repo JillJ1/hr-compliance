@@ -1,3 +1,10 @@
 streamlit
 pandas
 numpy
+requests
+pdfplumber
+beautifulsoup4
+sentence-transformers
+scikit-learn
+python-docx
+openpyxl
