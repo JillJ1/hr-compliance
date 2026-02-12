@@ -474,7 +474,6 @@ def generate_pdf_report(bill_data: Dict, handbook_text: str, analysis: Dict) -> 
 def render_dashboard(supabase: Client, company_id: str):
     st.title("🛡️ Compliance Risk Overview")
     try:
-        # Now that view includes company_id, filter by it
         status_data = supabase.table("compliance_status_view") \
             .select("*") \
             .eq("company_id", company_id) \
@@ -626,6 +625,8 @@ def render_compliance_tracking(supabase: Client, company_id: str):
 
 def render_legislative_intelligence(supabase: Client, company_id: str, api_key: str):
     st.title("⚖️ Legislative Intelligence")
+    
+    # Load handbook content for this company
     handbook_content = ""
     try:
         handbook_resp = supabase.table("handbooks") \
@@ -637,6 +638,7 @@ def render_legislative_intelligence(supabase: Client, company_id: str, api_key: 
             handbook_content = handbook_resp.data[0]["content"]
     except Exception as e:
         st.warning(f"Could not load handbook: {e}")
+    
     # Sidebar: Monitored Bills
     with st.sidebar:
         st.markdown("### 🔔 Monitored Bills")
@@ -667,8 +669,10 @@ def render_legislative_intelligence(supabase: Client, company_id: str, api_key: 
                 st.info("No bills monitored.")
         except Exception as e:
             st.error(f"Error loading monitored bills: {e}")
+    
     # Main tabs
     tab_search, tab_handbook, tab_analysis = st.tabs(["🔎 Search Bills", "📘 Handbook", "📊 Gap Analysis"])
+    
     with tab_search:
         st.subheader("Find Ohio Legislation")
         search_method = st.radio("Search by", ["Bill Number", "Keyword"], horizontal=True)
@@ -706,6 +710,7 @@ def render_legislative_intelligence(supabase: Client, company_id: str, api_key: 
                                 st.success(f"Loaded {bill['identifier']}")
                     else:
                         st.warning("No substantive bills found.")
+        
         if st.session_state.get("current_bill"):
             bill = st.session_state.current_bill
             st.divider()
@@ -752,23 +757,31 @@ def render_legislative_intelligence(supabase: Client, company_id: str, api_key: 
                     st.text_area("Bill content", st.session_state.bill_text[:5000], height=200, disabled=True)
                     if len(st.session_state.bill_text) > 5000:
                         st.caption(f"*Showing first 5,000 of {len(st.session_state.bill_text):,} characters*")
+    
     with tab_handbook:
         st.subheader("Employee Handbook")
         handbook_text = st.text_area(
             "Handbook content",
-            value=handbook_content,
+            value=st.session_state.get("handbook_content", handbook_content),
             height=400,
-            placeholder="Paste your employee handbook or policy text here..."
+            placeholder="Paste your employee handbook or policy text here...",
+            key="handbook_text_area"
         )
-        col_save, col_note = st.columns([1,3])
+        
+        # Version note - defined BEFORE save button
+        version_note = st.text_input("Version note (optional)", placeholder="e.g., Updated PTO policy")
+        
+        col_save, _ = st.columns([1,3])
         with col_save:
             if st.button("💾 Save Handbook", type="primary", use_container_width=True):
                 if handbook_text.strip():
                     try:
+                        # Upsert handbook
                         existing = supabase.table("handbooks") \
                             .select("id") \
                             .eq("company_id", company_id) \
                             .execute()
+                        
                         if existing.data:
                             supabase.table("handbooks") \
                                 .update({
@@ -782,18 +795,21 @@ def render_legislative_intelligence(supabase: Client, company_id: str, api_key: 
                                 "company_id": company_id,
                                 "content": handbook_text
                             }).execute()
+                        
+                        # Save version with note
                         supabase.table("handbook_versions").insert({
                             "company_id": company_id,
                             "content": handbook_text,
                             "version_note": version_note
                         }).execute()
+                        
                         log_action(supabase, "handbook_saved", {"note": version_note})
                         st.success("Handbook saved.")
                         st.session_state.handbook_content = handbook_text
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Failed to save: {e}")
-        with col_note:
-            version_note = st.text_input("Version note (optional)", placeholder="e.g., Updated PTO policy")
+        
         st.divider()
         st.subheader("📚 Version History")
         try:
@@ -804,8 +820,8 @@ def render_legislative_intelligence(supabase: Client, company_id: str, api_key: 
                 .limit(10) \
                 .execute().data
             for v in versions:
-                with st.expander(f"Version from {v['created_at'][:16]} – {v.get('version_note','No note')}"):
-                    st.text(v['content'][:1000] + ("..." if len(v['content'])>1000 else ""))
+                with st.expander(f"Version from {v['created_at'][:16]} – {v.get('version_note', 'No note')}"):
+                    st.text(v['content'][:1000] + ("..." if len(v['content']) > 1000 else ""))
                     if st.button("Restore this version", key=f"restore_{v['id']}"):
                         try:
                             supabase.table("handbooks") \
@@ -821,6 +837,7 @@ def render_legislative_intelligence(supabase: Client, company_id: str, api_key: 
                             st.error(f"Restore failed: {e}")
         except Exception as e:
             st.warning(f"Could not load versions: {e}")
+    
     with tab_analysis:
         st.subheader("Compliance Gap Analysis")
         if st.session_state.get("bill_text") and st.session_state.get("handbook_content"):
@@ -1051,9 +1068,6 @@ def main():
         st.write(f"**Semantic AI:** {'✅' if SEMANTIC_AVAILABLE else '⚠️ TF‑IDF'}")
         st.write(f"**PDF Reports:** {'✅' if PDF_REPORT_AVAILABLE else '❌'}")
 
-    # Execute the selected module (no arguments needed – they are captured in lambda)
-    modules[page]()
-
     # Initialize session state for bill data if not present
     if "current_bill" not in st.session_state:
         st.session_state.current_bill = None
@@ -1063,6 +1077,9 @@ def main():
         st.session_state.handbook_content = ""
     if "analysis_result" not in st.session_state:
         st.session_state.analysis_result = None
+
+    # Execute the selected module
+    modules[page]()
 
 if __name__ == "__main__":
     main()
