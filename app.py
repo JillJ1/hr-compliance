@@ -59,8 +59,6 @@ except ImportError:
 class Config:
     IRS_SEC_127_LIMIT = 5250.00
     MIN_TENURE_YEARS = 1.0
-    OPENSTATES_BASE_URL = "https://v3.openstates.org/bills"
-    OPENSTATES_JURISDICTION = "Ohio"
     API_TIMEOUT = 15
     MAX_PDF_PAGES = 30
     MAX_EXTRACT_CHARS = 20000
@@ -155,124 +153,6 @@ def risk_level_from_score(score: float) -> str:
     else:
         return "HIGH"
 
-# -------------------- OPEN STATES API --------------------
-@st.cache_data(ttl=300, show_spinner="Searching Ohio legislation...")
-def search_bills(keyword: str, api_key: str, year: int = 0) -> List[Dict]:
-    if not api_key or not keyword:
-        return []
-    headers = {"X-API-KEY": api_key}
-    params = {
-        "jurisdiction": Config.OPENSTATES_JURISDICTION,
-        "q": keyword,
-        "sort": "updated_desc",
-        "page": 1,
-        "per_page": 50
-    }
-    try:
-        resp = requests.get(Config.OPENSTATES_BASE_URL, headers=headers, params=params, timeout=Config.API_TIMEOUT)
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
-        results = data.get("results", [])
-        filtered = []
-        for bill in results:
-            bill_id = bill.get("identifier", "").upper()
-            if (bill_id.startswith("HB") or bill_id.startswith("SB") or
-                bill_id.startswith("HJR") or bill_id.startswith("SJR")):
-                if year > 2000:
-                    session = bill.get("session", "")
-                    if str(year) not in session:
-                        continue
-                filtered.append(bill)
-        return filtered[:20]
-    except Exception as e:
-        st.error(f"Search error: {e}")
-        return []
-
-@st.cache_data(ttl=3600, show_spinner="Fetching bill details...")
-def get_bill_by_number(bill_number: str, api_key: str) -> Dict:
-    if not api_key:
-        return {"error": "API key missing"}
-    bill_id = bill_number.strip().upper().replace(" ", "")
-    headers = {"X-API-KEY": api_key}
-    params = {
-        "jurisdiction": Config.OPENSTATES_JURISDICTION,
-        "bill_id": bill_id,
-        "page": 1,
-        "per_page": 1
-    }
-    try:
-        resp = requests.get(Config.OPENSTATES_BASE_URL, headers=headers, params=params, timeout=Config.API_TIMEOUT)
-        if resp.status_code == 401:
-            return {"error": "Invalid Open States API key."}
-        if resp.status_code != 200:
-            return {"error": f"API error {resp.status_code}"}
-        data = resp.json()
-        if not data.get("results"):
-            params["bill_id"] = bill_number.strip().upper()
-            resp = requests.get(Config.OPENSTATES_BASE_URL, headers=headers, params=params, timeout=Config.API_TIMEOUT)
-            if resp.status_code == 200:
-                data = resp.json()
-        if not data.get("results"):
-            return {"error": f"Bill '{bill_number}' not found in Ohio."}
-        bill = data["results"][0]
-        versions = []
-        for v in bill.get("versions", []):
-            version_info = {"date": v.get("date"), "title": v.get("note", "Unknown"), "url": None}
-            links = v.get("links", [])
-            for link in links:
-                url = link.get("url")
-                if url:
-                    version_info["url"] = url
-                    break
-            versions.append(version_info)
-        text_url = versions[0]["url"] if versions else None
-        return {
-            "identifier": bill.get("identifier"),
-            "title": bill.get("title"),
-            "session": bill.get("session"),
-            "updated_at": bill.get("updated_at"),
-            "text_url": text_url,
-            "abstract": bill.get("abstract") or bill.get("title"),
-            "status": bill.get("status"),
-            "classification": bill.get("classification", []),
-            "subjects": bill.get("subjects", []),
-            "versions": versions,
-            "sponsors": bill.get("sponsors", []),
-            "chamber": bill.get("chamber", "")
-        }
-    except Exception as e:
-        return {"error": f"Network error: {str(e)}"}
-
-@st.cache_data(ttl=3600, show_spinner="Extracting full text...")
-def extract_bill_text(url: str) -> str:
-    if not url:
-        return "[No text URL available]"
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        content_type = resp.headers.get('content-type', '').lower()
-        if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
-            if not PDF_SUPPORT:
-                return "[PDF extraction requires pdfplumber]"
-            with pdfplumber.open(BytesIO(resp.content)) as pdf:
-                pages = pdf.pages[:Config.MAX_PDF_PAGES]
-                text = "\n".join(p.extract_text() or "" for p in pages)
-                return text[:Config.MAX_EXTRACT_CHARS]
-        elif 'text/html' in content_type or url.endswith(('.htm', '.html')):
-            if not HTML_SUPPORT:
-                return "[HTML extraction requires beautifulsoup4]"
-            soup = BeautifulSoup(resp.content, 'html.parser')
-            for script in soup(["script", "style"]):
-                script.decompose()
-            text = soup.get_text(separator="\n")
-            text = re.sub(r'\n\s*\n', '\n\n', text)
-            return text[:Config.MAX_EXTRACT_CHARS]
-        else:
-            return f"[Unsupported content type: {content_type}]"
-    except Exception as e:
-        return f"[Extraction failed: {str(e)}]"
-
 # -------------------- COMPARISON ENGINE --------------------
 class ComplianceAnalyzer:
     @staticmethod
@@ -357,47 +237,6 @@ class ComplianceAnalyzer:
                 changes.append({"type": "insert", "new": lines2[j1:j2]})
         return changes
 
-# -------------------- MONITORED BILLS AUTO‑CHECK --------------------
-def check_all_monitored_bills(supabase: Client, api_key: str, company_id: str) -> List[Dict]:
-    try:
-        resp = supabase.table("monitored_bills") \
-            .select("*") \
-            .eq("company_id", company_id) \
-            .execute()
-        monitored = resp.data
-    except Exception as e:
-        st.error(f"Failed to load monitored bills: {e}")
-        return []
-    changed = []
-    for bill in monitored:
-        fresh = get_bill_by_number(bill["bill_id"], api_key)
-        if "error" in fresh:
-            continue
-        if not fresh.get("text_url"):
-            continue
-        current_text = extract_bill_text(fresh["text_url"])
-        current_hash = compute_text_hash(current_text)
-        if current_hash != bill.get("last_text_hash"):
-            try:
-                supabase.table("monitored_bills") \
-                    .update({
-                        "last_text_hash": current_hash,
-                        "last_checked": datetime.utcnow().isoformat(),
-                        "bill_title": fresh.get("title", "")
-                    }) \
-                    .eq("id", bill["id"]) \
-                    .execute()
-            except Exception as e:
-                st.error(f"Failed to update bill {bill['bill_id']}: {e}")
-                continue
-            changed.append({
-                "bill_id": bill["bill_id"],
-                "bill_title": fresh.get("title", ""),
-                "old_hash": bill.get("last_text_hash"),
-                "new_hash": current_hash
-            })
-    return changed
-
 # -------------------- PDF REPORT GENERATOR --------------------
 class ComplianceReportPDF(FPDF):
     def header(self):
@@ -410,61 +249,61 @@ class ComplianceReportPDF(FPDF):
         self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
     def chapter_title(self, title):
         self.set_font('Arial', 'B', 11)
-        self.set_fill_color(240,240,240)
-        self.cell(0,8,title,0,1,'L',1)
+        self.set_fill_color(240, 240, 240)
+        self.cell(0, 8, title, 0, 1, 'L', 1)
         self.ln(2)
     def chapter_body(self, text):
         self.set_font('Arial', '', 10)
         try:
-            self.multi_cell(0,5, text.encode('latin-1', errors='replace').decode('latin-1'))
+            self.multi_cell(0, 5, text.encode('latin-1', errors='replace').decode('latin-1'))
         except:
-            self.multi_cell(0,5, "[Text could not be rendered]")
+            self.multi_cell(0, 5, "[Text could not be rendered]")
         self.ln()
     def risk_meter(self, risk_level):
         self.set_font('Arial', 'B', 10)
-        color = {"LOW": (0,128,0), "MEDIUM": (255,165,0), "HIGH": (255,0,0)}.get(risk_level, (0,0,0))
+        color = {"LOW": (0, 128, 0), "MEDIUM": (255, 165, 0), "HIGH": (255, 0, 0)}.get(risk_level, (0, 0, 0))
         self.set_text_color(*color)
-        self.cell(0,6, f"Compliance Risk: {risk_level}", 0,1)
-        self.set_text_color(0,0,0)
+        self.cell(0, 6, f"Compliance Risk: {risk_level}", 0, 1)
+        self.set_text_color(0, 0, 0)
 
 def generate_pdf_report(bill_data: Dict, handbook_text: str, analysis: Dict) -> bytes:
     if not PDF_REPORT_AVAILABLE:
         return b"PDF generation requires fpdf library."
     pdf = ComplianceReportPDF()
     pdf.add_page()
-    pdf.set_font('Arial','B',16)
-    pdf.cell(0,10,'Compliance Gap Analysis',0,1,'C')
+    pdf.set_font('Arial', 'B', 16)
+    pdf.cell(0, 10, 'Compliance Gap Analysis', 0, 1, 'C')
     pdf.ln(5)
     pdf.chapter_title('Bill Information')
-    bill_info = f"Bill: {bill_data.get('identifier','N/A')}\n"
-    bill_info += f"Title: {bill_data.get('title','N/A')}\n"
-    bill_info += f"Session: {bill_data.get('session','N/A')}\n"
-    bill_info += f"Status: {bill_data.get('status','N/A')}\n"
-    bill_info += f"Last Updated: {bill_data.get('updated_at','N/A')}"
+    bill_info = f"Bill: {bill_data.get('identifier', 'N/A')}\n"
+    bill_info += f"Title: {bill_data.get('title', 'N/A')}\n"
+    bill_info += f"Session: {bill_data.get('session', 'N/A')}\n"
+    bill_info += f"Status: {bill_data.get('status', 'N/A')}\n"
+    bill_info += f"Last Updated: {bill_data.get('updated_at', 'N/A')}"
     pdf.chapter_body(bill_info)
     pdf.chapter_title('Risk Assessment')
     if "overall_similarity" in analysis:
         sim = analysis["overall_similarity"]
-        risk = analysis.get("compliance_risk","UNKNOWN")
+        risk = analysis.get("compliance_risk", "UNKNOWN")
         pdf.risk_meter(risk)
         pdf.chapter_body(f"Overall Semantic Similarity: {sim:.1%}")
     else:
         pdf.chapter_body("Semantic analysis not available.")
     if analysis.get("sentence_analysis"):
-        risky = [s for s in analysis["sentence_analysis"] if s.get("risk")=="HIGH"]
+        risky = [s for s in analysis["sentence_analysis"] if s.get("risk") == "HIGH"]
         if risky:
             pdf.chapter_title('High‑Risk Policy Gaps')
-            for i,r in enumerate(risky[:10]):
-                pdf.set_font('Arial','B',9)
-                pdf.cell(0,5,f"{i+1}. Policy Sentence:",0,1)
-                pdf.set_font('Arial','',9)
-                pdf.multi_cell(0,4,r['policy_sentence'][:300])
-                pdf.set_font('Arial','I',9)
-                pdf.cell(0,4,f"Similarity: {r['similarity']:.1%}",0,1)
+            for i, r in enumerate(risky[:10]):
+                pdf.set_font('Arial', 'B', 9)
+                pdf.cell(0, 5, f"{i+1}. Policy Sentence:", 0, 1)
+                pdf.set_font('Arial', '', 9)
+                pdf.multi_cell(0, 4, r['policy_sentence'][:300])
+                pdf.set_font('Arial', 'I', 9)
+                pdf.cell(0, 4, f"Similarity: {r['similarity']:.1%}", 0, 1)
                 pdf.ln(2)
     pdf.set_y(-20)
-    pdf.set_font('Arial','I',8)
-    pdf.cell(0,10,f'Generated by HR Sentinel on {datetime.now().strftime("%Y-%m-%d %H:%M")}',0,0,'C')
+    pdf.set_font('Arial', 'I', 8)
+    pdf.cell(0, 10, f'Generated by HR Sentinel on {datetime.now().strftime("%Y-%m-%d %H:%M")}', 0, 0, 'C')
     try:
         return pdf.output(dest='S').encode('latin-1', errors='replace')
     except:
@@ -481,22 +320,26 @@ def render_dashboard(supabase: Client, company_id: str):
     except Exception as e:
         st.error(f"Could not load compliance data: {e}")
         status_data = []
+    
     expired = sum(1 for r in status_data if r.get("calculated_status") == "Expired")
     due = sum(1 for r in status_data if r.get("calculated_status") == "Due Soon")
     compliant = sum(1 for r in status_data if r.get("calculated_status") == "Compliant")
     total = expired + due + compliant
     risk_score = 100 if total == 0 else max(0, 100 - ((expired * 5) + (due * 2)))
+    
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Risk Score", f"{risk_score}/100")
     col2.metric("Expired Items", expired)
     col3.metric("Due Soon", due)
     col4.metric("Compliant", compliant)
+    
     st.divider()
     st.subheader("Active Compliance Records")
     st.dataframe(status_data, use_container_width=True)
 
 def render_employees(supabase: Client, company_id: str):
     st.title("Workforce Management")
+    
     with st.expander("➕ Add New Employee", expanded=False):
         with st.form("add_employee"):
             first = st.text_input("First Name")
@@ -505,6 +348,7 @@ def render_employees(supabase: Client, company_id: str):
             status = st.selectbox("Employment Status", ["Active", "LOA", "Terminated"])
             flsa = st.selectbox("FLSA Classification", ["Exempt", "Non-Exempt"])
             work_auth = st.date_input("Work Authorization Expiration (optional)", value=None)
+            
             submitted = st.form_submit_button("Create Employee")
             if submitted and first and last:
                 try:
@@ -522,6 +366,7 @@ def render_employees(supabase: Client, company_id: str):
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed to add employee: {e}")
+    
     try:
         employees = supabase.table("employees") \
             .select("*") \
@@ -533,6 +378,7 @@ def render_employees(supabase: Client, company_id: str):
 
 def render_requirements(supabase: Client, company_id: str):
     st.title("Compliance Requirements Engine")
+    
     try:
         categories = supabase.table("compliance_categories") \
             .select("*") \
@@ -542,12 +388,14 @@ def render_requirements(supabase: Client, company_id: str):
     except Exception as e:
         st.error(f"Could not load categories: {e}")
         category_map = {}
+    
     with st.expander("➕ Create New Requirement", expanded=False):
         with st.form("add_requirement"):
             title = st.text_input("Requirement Title")
             category = st.selectbox("Category", list(category_map.keys()))
             renewal = st.number_input("Renewal Period (days)", min_value=0, value=365)
             mandatory = st.checkbox("Mandatory", value=True)
+            
             submitted = st.form_submit_button("Create Requirement")
             if submitted and title and category:
                 try:
@@ -563,6 +411,7 @@ def render_requirements(supabase: Client, company_id: str):
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed to create requirement: {e}")
+    
     try:
         requirements = supabase.table("compliance_requirements") \
             .select("*") \
@@ -574,6 +423,7 @@ def render_requirements(supabase: Client, company_id: str):
 
 def render_compliance_tracking(supabase: Client, company_id: str):
     st.title("Employee Compliance Assignments")
+    
     try:
         employees = supabase.table("employees") \
             .select("id, first_name, last_name") \
@@ -584,6 +434,7 @@ def render_compliance_tracking(supabase: Client, company_id: str):
     except Exception as e:
         st.error(f"Could not load employees: {e}")
         emp_map = {}
+    
     try:
         requirements = supabase.table("compliance_requirements") \
             .select("id, title") \
@@ -593,12 +444,14 @@ def render_compliance_tracking(supabase: Client, company_id: str):
     except Exception as e:
         st.error(f"Could not load requirements: {e}")
         req_map = {}
+    
     with st.expander("➕ Assign Requirement to Employee", expanded=False):
         with st.form("assign_requirement"):
             emp = st.selectbox("Employee", list(emp_map.keys()) if emp_map else [])
             req = st.selectbox("Requirement", list(req_map.keys()) if req_map else [])
             completion = st.date_input("Completion Date", value=date.today())
             expiration = st.date_input("Expiration Date", value=date.today() + timedelta(days=365))
+            
             submitted = st.form_submit_button("Assign")
             if submitted and emp and req:
                 try:
@@ -614,6 +467,7 @@ def render_compliance_tracking(supabase: Client, company_id: str):
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed to assign: {e}")
+    
     try:
         records = supabase.table("compliance_status_view") \
             .select("*") \
@@ -623,8 +477,10 @@ def render_compliance_tracking(supabase: Client, company_id: str):
     except Exception as e:
         st.error(f"Could not load compliance records: {e}")
 
-def render_legislative_intelligence(supabase: Client, company_id: str, api_key: str):
-    st.title("⚖️ Legislative Intelligence")
+# -------------------- COMPLIANCE INTELLIGENCE - PLACEHOLDER VERSION --------------------
+def render_compliance_intelligence(supabase: Client, company_id: str, api_key: str = None):
+    """🚀 Compliance Intelligence with PLACEHOLDER data - APIs to be connected later"""
+    st.title("⚖️ Compliance Intelligence")
     
     # Load handbook content for this company
     handbook_content = ""
@@ -636,142 +492,201 @@ def render_legislative_intelligence(supabase: Client, company_id: str, api_key: 
             .execute()
         if handbook_resp.data:
             handbook_content = handbook_resp.data[0]["content"]
+            st.session_state.handbook_content = handbook_content
     except Exception as e:
         st.warning(f"Could not load handbook: {e}")
     
-    # Sidebar: Monitored Bills
-    with st.sidebar:
-        st.markdown("### 🔔 Monitored Bills")
-        try:
-            monitored = supabase.table("monitored_bills") \
-                .select("*") \
-                .eq("company_id", company_id) \
-                .execute().data
-            if monitored:
-                for m in monitored:
-                    col1, col2 = st.columns([4,1])
-                    with col1:
-                        st.markdown(f"**{m['bill_id']}**")
-                        st.caption(m.get('bill_title', '')[:40] + "...")
-                    with col2:
-                        if st.button("✕", key=f"remove_{m['id']}"):
-                            supabase.table("monitored_bills").delete().eq("id", m["id"]).execute()
-                            st.rerun()
-                if st.button("🔄 Check All for Updates", use_container_width=True):
-                    with st.spinner("Checking monitored bills..."):
-                        changed = check_all_monitored_bills(supabase, api_key, company_id)
-                        if changed:
-                            for b in changed:
-                                st.error(f"🚨 **{b['bill_id']}** – Updated!")
-                        else:
-                            st.success("All monitored bills are current.")
-            else:
-                st.info("No bills monitored.")
-        except Exception as e:
-            st.error(f"Error loading monitored bills: {e}")
+    # Main tabs - All placeholders ready for real APIs
+    tab_osha, tab_settlements, tab_regs, tab_dol, tab_handbook = st.tabs([
+        "🚨 OSHA Citations", 
+        "⚖️ Settlements",
+        "📋 Federal Regs",
+        "📝 DOL Guidance",
+        "📘 Handbook"
+    ])
     
-    # Main tabs
-    tab_search, tab_handbook, tab_analysis = st.tabs(["🔎 Search Bills", "📘 Handbook", "📊 Gap Analysis"])
-    
-    with tab_search:
-        st.subheader("Find Ohio Legislation")
-        search_method = st.radio("Search by", ["Bill Number", "Keyword"], horizontal=True)
-        if search_method == "Bill Number":
-            bill_input = st.text_input("Enter bill number (e.g., HB33, SB 1)", value="HB33")
-            if st.button("📥 Fetch Bill", type="primary"):
-                with st.spinner("Fetching..."):
-                    bill = get_bill_by_number(bill_input, api_key)
-                    if "error" in bill:
-                        st.error(bill["error"])
-                    else:
-                        st.session_state.current_bill = bill
-                        st.session_state.bill_text = None
-                        st.success(f"Loaded {bill['identifier']}")
-        else:
-            col1, col2 = st.columns([3,1])
-            with col1:
-                keyword = st.text_input("Keyword (e.g., 'minimum wage', 'healthcare')")
-            with col2:
-                year = st.selectbox("Year", [0] + list(range(2026,2020,-1)), format_func=lambda x: "All" if x==0 else str(x))
-            if keyword:
-                with st.spinner("Searching..."):
-                    results = search_bills(keyword, api_key, year)
-                    if results:
-                        bill_titles = [f"{r['identifier']}: {r['title'][:80]}..." for r in results]
-                        selected_idx = st.selectbox("Select a bill", range(len(bill_titles)), format_func=lambda i: bill_titles[i])
-                        selected = results[selected_idx]
-                        if st.button("📥 Load Selected Bill", type="primary"):
-                            bill = get_bill_by_number(selected["identifier"], api_key)
-                            if "error" in bill:
-                                st.error(bill["error"])
-                            else:
-                                st.session_state.current_bill = bill
-                                st.session_state.bill_text = None
-                                st.success(f"Loaded {bill['identifier']}")
-                    else:
-                        st.warning("No substantive bills found.")
+    with tab_osha:
+        st.subheader("OSHA Citation Lookup")
+        st.caption("🔍 PLACEHOLDER - OSHA API connection pending")
         
-        if st.session_state.get("current_bill"):
-            bill = st.session_state.current_bill
-            st.divider()
-            st.success(f"**{bill['identifier']}** – {bill['title']}")
-            cols = st.columns(4)
-            cols[0].metric("Session", bill.get('session','N/A'))
-            cols[1].metric("Status", str(bill.get('status','N/A')).capitalize())
-            cols[2].metric("Updated", bill.get('updated_at','')[:10] if bill.get('updated_at') else 'N/A')
-            cols[3].metric("Chamber", bill.get('chamber','N/A').capitalize())
-            with st.expander("📄 Bill Abstract & Versions"):
-                st.markdown(f"**Abstract:** {bill.get('abstract','No abstract.')}")
-                if bill.get('versions'):
-                    st.markdown("**Versions:**")
-                    for v in bill['versions'][:3]:
-                        if v.get('url'):
-                            st.markdown(f"- [{v.get('title','Version')}]({v['url']})")
-            if bill.get('text_url'):
-                col1, col2 = st.columns([1,1])
-                with col1:
-                    if st.button("📄 Extract Full Text", use_container_width=True):
-                        with st.spinner("Extracting..."):
-                            st.session_state.bill_text = extract_bill_text(bill['text_url'])
-                with col2:
-                    if st.button("🔔 Monitor This Bill", use_container_width=True):
-                        if st.session_state.get("bill_text"):
-                            text_hash = compute_text_hash(st.session_state.bill_text)
-                            try:
-                                supabase.table("monitored_bills").insert({
-                                    "company_id": company_id,
-                                    "bill_id": bill['identifier'],
-                                    "bill_title": bill['title'],
-                                    "last_text_hash": text_hash,
-                                    "last_checked": datetime.utcnow().isoformat()
-                                }).execute()
-                                log_action(supabase, "monitor_bill", {"bill_id": bill['identifier']})
-                                st.success("Now monitoring this bill.")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Failed to monitor: {e}")
-                        else:
-                            st.warning("Extract bill text first.")
-            if st.session_state.get("bill_text"):
-                with st.expander("📜 Full Bill Text (preview)"):
-                    st.text_area("Bill content", st.session_state.bill_text[:5000], height=200, disabled=True)
-                    if len(st.session_state.bill_text) > 5000:
-                        st.caption(f"*Showing first 5,000 of {len(st.session_state.bill_text):,} characters*")
+        col1, col2 = st.columns(2)
+        with col1:
+            naics = st.text_input("NAICS Code (optional)", 
+                                 placeholder="e.g., 541611, 238160",
+                                 help="Find your NAICS code at naics.com")
+        with col2:
+            state = st.selectbox("State", 
+                               ["", "OH", "CA", "TX", "NY", "FL", "IL", "PA"],
+                               index=0)
+        
+        if st.button("🔍 Search OSHA Citations", type="primary"):
+            with st.spinner("Fetching OSHA enforcement data..."):
+                # TODO: Replace with actual OSHA API
+                # API Endpoint: https://www.osha.gov/enforcement/data/inspections
+                # Documentation: https://www.osha.gov/developers
+                
+                st.info("📌 **OSHA API Integration Coming Soon**")
+                st.markdown("""
+                **Sample OSHA Citation Data (For Demonstration):**
+                
+                🚨 **Fall Protection - General Requirements**  
+                - 📊 156 citations in your industry  
+                - 💰 Average penalty: $4,321  
+                - 📋 Standard: 1926.501  
+                ---
+                
+                🚨 **Hazard Communication**  
+                - 📊 98 citations in your industry  
+                - 💰 Average penalty: $3,890  
+                - 📋 Standard: 1910.1200  
+                ---
+                
+                🚨 **Respiratory Protection**  
+                - 📊 67 citations in your industry  
+                - 💰 Average penalty: $2,456  
+                - 📋 Standard: 1910.134  
+                ---
+                """)
+        
+        log_action(supabase, "osha_search_placeholder", {
+            "naics": naics,
+            "state": state,
+            "timestamp": datetime.now().isoformat()
+        })
+    
+    with tab_settlements:
+        st.subheader("Recent FLSA Settlements")
+        st.caption("⚖️ PLACEHOLDER - CourtListener API connection pending")
+        
+        days = st.slider("Look back period (days)", 7, 90, 30)
+        
+        if st.button("🔄 Refresh Settlements"):
+            with st.spinner("Fetching court cases..."):
+                # TODO: Replace with actual CourtListener API
+                # API Endpoint: https://www.courtlistener.com/api/rest/v3/
+                # Get free key: https://www.courtlistener.com/api/register/
+                
+                st.info("📌 **CourtListener API Integration Coming Soon**")
+                st.markdown("""
+                **Sample FLSA Settlement Data (For Demonstration):**
+                
+                💰 **Martinez v. Amazon Logistics - $8,400,000**  
+                - **Issue:** Off-the-clock work  
+                - **Class Size:** 4,200 employees  
+                - **Filed:** 2024-02-15  
+                
+                💰 **Johnson v. Walmart Inc. - $3,200,000**  
+                - **Issue:** Missed meal breaks  
+                - **Class Size:** 1,850 employees  
+                - **Filed:** 2024-02-10  
+                
+                💰 **Williams v. Target Corp - $2,100,000**  
+                - **Issue:** Overtime misclassification  
+                - **Class Size:** 950 employees  
+                - **Filed:** 2024-02-05  
+                
+                💰 **Brown v. Starbucks - $1,800,000**  
+                - **Issue:** Remote work time tracking  
+                - **Class Size:** 3,100 employees  
+                - **Filed:** 2024-01-28  
+                """)
+    
+    with tab_regs:
+        st.subheader("📋 Federal Register - New Regulations")
+        st.caption("🇺🇸 PLACEHOLDER - Federal Register API connection pending")
+        
+        days_reg = st.selectbox("Time period", [7, 30, 60, 90], index=1, 
+                               format_func=lambda x: f"Last {x} days")
+        
+        with st.spinner("Checking federal regulations..."):
+            # TODO: Replace with actual Federal Register API
+            # API Endpoint: https://www.federalregister.gov/api/v1/
+            # Documentation: https://www.federalregister.gov/developers/api/v1
+            
+            st.info("📌 **Federal Register API Integration Coming Soon**")
+            st.markdown("""
+            **Sample Federal Register Data (For Demonstration):**
+            
+            📌 **Improving Protections for Workers in Temporary Agricultural Employment**  
+            - **Agency:** Wage and Hour Division  
+            - **Publication Date:** 2024-02-16  
+            - **Effective Date:** 2024-03-18  
+            - **Document #:** 2024-12345  
+            
+            📌 **Equal Employment Opportunity for Individuals with Disabilities**  
+            - **Agency:** EEOC  
+            - **Publication Date:** 2024-02-10  
+            - **Effective Date:** 2024-04-01  
+            - **Document #:** 2024-67890  
+            
+            📌 **Updating the Davis-Bacon and Related Acts Regulations**  
+            - **Agency:** Wage and Hour Division  
+            - **Publication Date:** 2024-02-05  
+            - **Effective Date:** 2024-05-15  
+            - **Document #:** 2024-54321  
+            """)
+    
+    with tab_dol:
+        st.subheader("📝 DOL Opinion Letters")
+        st.caption("Official Wage and Hour Division guidance - PLACEHOLDER")
+        
+        query = st.text_input("Search DOL guidance", 
+                             placeholder="e.g., remote work, overtime, meal breaks",
+                             key="dol_search")
+        
+        if query and len(query) > 2:
+            with st.spinner("Searching DOL opinion letters..."):
+                # TODO: Replace with actual DOL API
+                # API Endpoint: https://api.dol.gov/V1/Wage_Hour
+                # Get free key: https://developer.dol.gov/signup
+                
+                st.info("📌 **DOL API Integration Coming Soon**")
+                st.markdown("""
+                **Sample DOL Opinion Letters (For Demonstration):**
+                
+                📄 **Opinion Letter: FLSA2024-12** - March 15, 2024
+                
+                **Question:** Must employees be compensated for mandatory virtual training outside work hours?
+                
+                **Answer:** Yes. If the training is required and directly related to the employee's job, 
+                it constitutes "hours worked" under the FLSA and must be compensated.
+                
+                ---
+                
+                📄 **Opinion Letter: FLSA2024-08** - February 22, 2024
+                
+                **Question:** Are remote employees entitled to overtime for responding to emails after hours?
+                
+                **Answer:** Yes. Time spent working outside of scheduled hours, including responding to 
+                emails or calls, must be counted as hours worked for overtime purposes.
+                
+                ---
+                
+                📄 **Opinion Letter: FLSA2024-03** - January 10, 2024
+                
+                **Question:** Does the FLSA require compensation for time spent in security screenings?
+                
+                **Answer:** Under the Portal-to-Portal Act, time spent in security screenings is compensable 
+                if it is an integral and indispensable part of the employee's principal activities.
+                """)
     
     with tab_handbook:
-        st.subheader("Employee Handbook")
+        st.subheader("📘 Employee Handbook")
+        st.caption("Version control with audit trail")
+        
         handbook_text = st.text_area(
             "Handbook content",
             value=st.session_state.get("handbook_content", handbook_content),
             height=400,
             placeholder="Paste your employee handbook or policy text here...",
-            key="handbook_text_area"
+            key="handbook_text_area_final"
         )
         
-        # Version note - defined BEFORE save button
-        version_note = st.text_input("Version note (optional)", placeholder="e.g., Updated PTO policy")
+        # ✅ Version note - DEFINED BEFORE save button
+        version_note = st.text_input("Version note (optional)", 
+                                    placeholder="e.g., Updated remote work policy, Added AI usage policy")
         
-        col_save, _ = st.columns([1,3])
+        col_save, _ = st.columns([1, 3])
         with col_save:
             if st.button("💾 Save Handbook", type="primary", use_container_width=True):
                 if handbook_text.strip():
@@ -796,15 +711,15 @@ def render_legislative_intelligence(supabase: Client, company_id: str, api_key: 
                                 "content": handbook_text
                             }).execute()
                         
-                        # Save version with note
+                        # ✅ Save version with note - version_note is defined
                         supabase.table("handbook_versions").insert({
                             "company_id": company_id,
                             "content": handbook_text,
-                            "version_note": version_note
+                            "version_note": version_note if version_note else "No version note"
                         }).execute()
                         
                         log_action(supabase, "handbook_saved", {"note": version_note})
-                        st.success("Handbook saved.")
+                        st.success("✅ Handbook saved successfully")
                         st.session_state.handbook_content = handbook_text
                         st.rerun()
                     except Exception as e:
@@ -819,103 +734,58 @@ def render_legislative_intelligence(supabase: Client, company_id: str, api_key: 
                 .order("created_at", desc=True) \
                 .limit(10) \
                 .execute().data
-            for v in versions:
-                with st.expander(f"Version from {v['created_at'][:16]} – {v.get('version_note', 'No note')}"):
-                    st.text(v['content'][:1000] + ("..." if len(v['content']) > 1000 else ""))
-                    if st.button("Restore this version", key=f"restore_{v['id']}"):
-                        try:
-                            supabase.table("handbooks") \
-                                .update({
-                                    "content": v['content'],
-                                    "updated_at": datetime.utcnow().isoformat()
-                                }) \
-                                .eq("company_id", company_id) \
-                                .execute()
-                            st.success("Handbook restored.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Restore failed: {e}")
+            
+            if versions:
+                for v in versions:
+                    created_at = v.get('created_at', '')
+                    if len(created_at) > 10:
+                        created_at = created_at[:10]
+                    
+                    with st.expander(f"📅 {created_at} – {v.get('version_note', 'No note')}"):
+                        st.text(v['content'][:1000] + ("..." if len(v['content']) > 1000 else ""))
+                        if st.button("↩️ Restore this version", key=f"restore_{v['id']}"):
+                            try:
+                                supabase.table("handbooks") \
+                                    .update({
+                                        "content": v['content'],
+                                        "updated_at": datetime.utcnow().isoformat()
+                                    }) \
+                                    .eq("company_id", company_id) \
+                                    .execute()
+                                st.success("✅ Handbook restored")
+                                st.session_state.handbook_content = v['content']
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Restore failed: {e}")
+            else:
+                st.info("No version history yet. Save your first handbook version.")
         except Exception as e:
             st.warning(f"Could not load versions: {e}")
-    
-    with tab_analysis:
-        st.subheader("Compliance Gap Analysis")
-        if st.session_state.get("bill_text") and st.session_state.get("handbook_content"):
-            if st.button("🔬 Run Full Analysis", type="primary"):
-                with st.spinner("🧠 Analyzing semantic alignment..."):
-                    result = ComplianceAnalyzer.semantic_similarity(
-                        st.session_state.handbook_content,
-                        st.session_state.bill_text
-                    )
-                    st.session_state.analysis_result = result
-            if st.session_state.get("analysis_result"):
-                res = st.session_state.analysis_result
-                if "error" in res:
-                    st.error(res["error"])
-                else:
-                    sim = res.get("overall_similarity", 0)
-                    risk = res.get("compliance_risk", "UNKNOWN")
-                    risk_color = {"LOW":"green","MEDIUM":"orange","HIGH":"red"}.get(risk,"gray")
-                    col1, col2, col3 = st.columns([1,1,2])
-                    col1.metric("Similarity", f"{sim:.1%}")
-                    col2.markdown(f"**Risk**  \n:<span style='color:{risk_color};font-size:1.8rem;font-weight:bold'>{risk}</span>", unsafe_allow_html=True)
-                    col3.info(f"**Method:** {res.get('method','N/A')}")
-                    if res.get("sentence_analysis"):
-                        with st.expander("⚠️ High‑Risk Sentences", expanded=True):
-                            risky = [s for s in res["sentence_analysis"] if s["risk"]=="HIGH"][:7]
-                            if risky:
-                                for r in risky:
-                                    st.markdown(f"**Policy:** {r['policy_sentence']}")
-                                    st.markdown(f"→ **Bill:** {r['bill_sentence'][:200]}...")
-                                    st.markdown(f"*Similarity: {r['similarity']:.1%}*")
-                                    st.divider()
-                            else:
-                                st.success("No high‑risk sentences detected.")
-                    with st.expander("📝 Line‑by‑Line Difference"):
-                        diff = ComplianceAnalyzer.classic_diff(
-                            st.session_state.handbook_content,
-                            st.session_state.bill_text
-                        )
-                        for change in diff[:10]:
-                            st.markdown(f"**Change Type:** {change['type']}")
-                            if "old" in change:
-                                st.code("\n".join(change["old"]), language="text")
-                            if "new" in change:
-                                st.code("\n".join(change["new"]), language="text")
-                            st.divider()
-                    if st.session_state.get("current_bill"):
-                        pdf_bytes = generate_pdf_report(
-                            st.session_state.current_bill,
-                            st.session_state.handbook_content,
-                            res
-                        )
-                        st.download_button(
-                            "📄 Download PDF Report",
-                            data=pdf_bytes,
-                            file_name=f"compliance_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                            mime="application/pdf"
-                        )
-        else:
-            if not st.session_state.get("bill_text"):
-                st.info("👆 Extract a bill's full text first.")
-            if not st.session_state.get("handbook_content"):
-                st.info("👆 Save your employee handbook.")
 
 def render_policy_governance(supabase: Client, company_id: str):
     st.title("📋 Policy Governance")
     tab_redliner, tab_timeline = st.tabs(["📝 Policy Redliner", "📅 Timeline Projector"])
+    
     with tab_redliner:
         st.subheader("Statutory vs. Internal Policy Comparator")
         col1, col2 = st.columns(2)
         with col1:
-            policy_text = st.text_area("Current policy text", height=250, key="redliner_policy")
+            policy_text = st.text_area("Current policy text", height=250, 
+                                      placeholder="Paste your current policy...",
+                                      key="redliner_policy")
         with col2:
-            statute_text = st.text_area("New statutory text", height=250, key="redliner_statute")
-        if st.button("Run Gap Analysis", key="run_redliner"):
+            statute_text = st.text_area("New statutory text", height=250, 
+                                       placeholder="Paste the new law/regulation...",
+                                       key="redliner_statute")
+        
+        if st.button("Run Gap Analysis", key="run_redliner", type="primary"):
             if policy_text and statute_text:
                 sents1 = tokenize_sentences(policy_text)
                 sents2 = tokenize_sentences(statute_text)
                 differ = difflib.SequenceMatcher(None, sents1, sents2)
+                
+                st.subheader("📊 Gap Analysis Results")
+                
                 for tag, i1, i2, j1, j2 in differ.get_opcodes():
                     if tag == 'equal':
                         for sent in sents1[i1:i2]:
@@ -935,17 +805,23 @@ def render_policy_governance(supabase: Client, company_id: str):
                     elif tag == 'delete':
                         st.markdown("**:red[❌ REMOVED]**")
                         for sent in sents1[i1:i2]:
-                            st.error(sent)
+                            st.error(f"~~{sent}~~")
                     elif tag == 'insert':
                         st.markdown("**:green[➕ ADDED]**")
                         for sent in sents2[j1:j2]:
                             st.success(sent)
             else:
-                st.warning("Both fields required.")
+                st.warning("Both policy text and statutory text are required.")
+    
     with tab_timeline:
         st.subheader("Compliance Work‑Back Schedule")
-        effective_date = st.date_input("Statutory Effective Date", value=date.today() + timedelta(days=90))
-        if st.button("Generate Timeline", key="gen_timeline"):
+        st.caption("Plan your compliance implementation timeline")
+        
+        effective_date = st.date_input("Statutory Effective Date", 
+                                      value=date.today() + timedelta(days=90),
+                                      help="When does the new law take effect?")
+        
+        if st.button("Generate Timeline", key="gen_timeline", type="primary"):
             milestones = [
                 ("Audit of Current Policies", 90),
                 ("Drafting of Policy Updates", 60),
@@ -955,64 +831,100 @@ def render_policy_governance(supabase: Client, company_id: str):
                 ("Employee Notification", 7),
                 ("Go-Live / Effective Date", 0)
             ]
+            
             data = []
             for task, days in milestones:
                 due = effective_date - timedelta(days=days)
+                status = "⚠️ Due Soon" if 0 < days <= 15 else "📅 Planned"
+                if days == 0:
+                    status = "🎯 Effective Date"
+                elif due < date.today():
+                    status = "❌ Overdue"
+                    
                 data.append({
                     "Milestone": task,
                     "Due Date": due.strftime('%Y-%m-%d'),
-                    "Lead Days": days,
-                    "Phase": "Preparation" if days > 0 else "Execution"
+                    "Days Before Effective": days,
+                    "Status": status
                 })
+            
             df = pd.DataFrame(data)
             st.table(df)
+            
             csv = df.to_csv(index=False)
-            st.download_button("📥 Export Timeline (CSV)", csv, "compliance_timeline.csv")
+            st.download_button(
+                "📥 Export Timeline (CSV)",
+                data=csv,
+                file_name=f"compliance_timeline_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
 
 def render_tuition_module(supabase: Client, company_id: str):
     st.title("💰 Tuition Reimbursement Auditor")
     st.caption(f"IRS §127 limit: ${Config.IRS_SEC_127_LIMIT:,.2f} | Min tenure: {Config.MIN_TENURE_YEARS} year")
+    
     with st.expander("📥 Download CSV Template"):
-        template_df = pd.DataFrame(columns=['EmployeeID','TenureYears','RequestAmount','DegreeProgram'])
-        st.download_button("Download Template", data=template_df.to_csv(index=False),
-                           file_name="tuition_audit_template.csv", mime="text/csv")
+        template_df = pd.DataFrame(columns=['EmployeeID', 'TenureYears', 'RequestAmount', 'DegreeProgram'])
+        csv_template = template_df.to_csv(index=False)
+        st.download_button(
+            "Download Template",
+            data=csv_template,
+            file_name="tuition_audit_template.csv",
+            mime="text/csv"
+        )
+    
     uploaded = st.file_uploader("Upload Request CSV", type=['csv'])
+    
     if uploaded:
         try:
             df = pd.read_csv(uploaded)
         except Exception as e:
             st.error(f"CSV parsing error: {e}")
             return
+        
         required = {'EmployeeID': 'str', 'TenureYears': 'float', 'RequestAmount': 'float'}
         errors = validate_schema(df, required)
+        
         if errors:
             for e in errors:
                 st.error(e)
             st.stop()
+        
         df['TenureYears'] = pd.to_numeric(df['TenureYears'], errors='coerce')
         df['RequestAmount'] = pd.to_numeric(df['RequestAmount'], errors='coerce')
         df.dropna(subset=['TenureYears', 'RequestAmount'], inplace=True)
+        
         conditions = [
             (df['TenureYears'] < Config.MIN_TENURE_YEARS),
             (df['RequestAmount'] > Config.IRS_SEC_127_LIMIT)
         ]
+        
         status_choices = ['Ineligible', 'Eligible (Taxable)']
         basis_choices = [f"Tenure < {Config.MIN_TENURE_YEARS}yr", f"Exceeds IRS ${Config.IRS_SEC_127_LIMIT:,.0f}"]
+        
         df['Decision'] = np.select(conditions, status_choices, default='Eligible (Tax‑Free)')
         df['Basis'] = np.select(conditions, basis_choices, default='Meets criteria')
         df['Taxable_Amount'] = np.where(df['Decision'] == 'Eligible (Taxable)',
                                          df['RequestAmount'] - Config.IRS_SEC_127_LIMIT, 0.0)
+        
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Processed", len(df))
         col2.metric("Tax‑Free", len(df[df['Decision'] == 'Eligible (Tax‑Free)']))
         col3.metric("Taxable", len(df[df['Decision'] == 'Eligible (Taxable)']))
         col4.metric("Total Exposure", f"${df['Taxable_Amount'].sum():,.2f}")
-        st.dataframe(df[['EmployeeID','RequestAmount','Decision','Taxable_Amount','Basis']],
-                     use_container_width=True, hide_index=True)
-        st.download_button("📄 Download Audit Report (CSV)",
-                           data=df.to_csv(index=False),
-                           file_name=f"tuition_audit_{datetime.now().strftime('%Y%m%d')}.csv",
-                           mime="text/csv")
+        
+        st.dataframe(
+            df[['EmployeeID', 'RequestAmount', 'Decision', 'Taxable_Amount', 'Basis']],
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        st.download_button(
+            "📄 Download Audit Report (CSV)",
+            data=df.to_csv(index=False),
+            file_name=f"tuition_audit_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
 
 # -------------------- MAIN APP --------------------
 def main():
@@ -1022,6 +934,7 @@ def main():
         initial_sidebar_state="expanded",
         page_icon="🛡️"
     )
+    
     st.markdown("""
     <style>
         .stApp { background-color: #f8fafc; }
@@ -1029,6 +942,9 @@ def main():
         .stMetric { background-color: white; padding: 1rem; border-radius: 0.75rem; box-shadow: 0 2px 5px rgba(0,0,0,0.03); }
         div[data-testid="stExpander"] { background-color: white; border-radius: 0.5rem; border: 1px solid #e2e8f0; }
         .stAlert { border-radius: 0.5rem; }
+        .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+        .stTabs [data-baseweb="tab"] { border-radius: 4px 4px 0px 0px; padding: 8px 16px; background-color: white; }
+        .stTabs [aria-selected="true"] { background-color: #e6f7ff; border-bottom: 2px solid #1890ff; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1042,18 +958,16 @@ def main():
         st.error("Company setup failed.")
         st.stop()
 
-    api_key = st.secrets.get("OPENSTATES_API_KEY") if hasattr(st, 'secrets') else None
-
     st.sidebar.markdown("## 🛡️ HR Sentinel")
     st.sidebar.caption("Workforce Compliance Infrastructure")
 
-    # ----- MODULES DICTIONARY – all functions receive dependencies via lambdas -----
+    # ----- MODULES DICTIONARY – Open States REMOVED -----
     modules = {
         "Dashboard": lambda: render_dashboard(supabase, company_id),
         "Workforce": lambda: render_employees(supabase, company_id),
         "Requirements": lambda: render_requirements(supabase, company_id),
         "Compliance Tracking": lambda: render_compliance_tracking(supabase, company_id),
-        "Legislative Intelligence": lambda: render_legislative_intelligence(supabase, company_id, api_key),
+        "Compliance Intelligence": lambda: render_compliance_intelligence(supabase, company_id, None),
         "Policy Governance": lambda: render_policy_governance(supabase, company_id),
         "Tuition Auditor": lambda: render_tuition_module(supabase, company_id),
     }
@@ -1063,16 +977,13 @@ def main():
     st.sidebar.divider()
     with st.sidebar.expander("🔧 System Status", expanded=False):
         st.write(f"**Supabase:** {'✅' if supabase else '❌'}")
-        st.write(f"**Open States API:** {'✅' if api_key else '❌'}")
         st.write(f"**PDF extraction:** {'✅' if PDF_SUPPORT else '❌'}")
         st.write(f"**Semantic AI:** {'✅' if SEMANTIC_AVAILABLE else '⚠️ TF‑IDF'}")
         st.write(f"**PDF Reports:** {'✅' if PDF_REPORT_AVAILABLE else '❌'}")
+        st.write(f"**Compliance APIs:** ⏳ Coming Soon")
+        st.caption("OSHA, CourtListener, Federal Register, DOL")
 
-    # Initialize session state for bill data if not present
-    if "current_bill" not in st.session_state:
-        st.session_state.current_bill = None
-    if "bill_text" not in st.session_state:
-        st.session_state.bill_text = None
+    # Initialize session state
     if "handbook_content" not in st.session_state:
         st.session_state.handbook_content = ""
     if "analysis_result" not in st.session_state:
